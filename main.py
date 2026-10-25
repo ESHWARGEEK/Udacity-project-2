@@ -100,105 +100,111 @@ class MemoryHook(HookProvider):
         self.namespaces = get_namespaces(mem_client, memory_id)
 
     def register_hooks(self, registry: HookRegistry):
-        # Explicitly avoid 'add_hook' as it registers the provider, not the individual event subscriptions.
-        if hasattr(registry, 'subscribe'):
-            registry.subscribe(MessageAddedEvent, self.retrieve_customer_context)
-            registry.subscribe(AfterInvocationEvent, self.save_support_interaction)
-        elif hasattr(registry, 'on'):
-            registry.on(MessageAddedEvent, self.retrieve_customer_context)
-            registry.on(AfterInvocationEvent, self.save_support_interaction)
-        elif hasattr(registry, 'add_handler'):
-            registry.add_handler(MessageAddedEvent, self.retrieve_customer_context)
-            registry.add_handler(AfterInvocationEvent, self.save_support_interaction)
-        else:
-            logger.error(f"Could not find valid event subscription method. Available on registry: {dir(registry)}")
+        try:
+            registry.add_callback(MessageAddedEvent, self.retrieve_customer_context)
+            registry.add_callback(AfterInvocationEvent, self.save_support_interaction)
+        except Exception as e:
+            logger.error(f"Failed to register hooks: {e}")
 
     def retrieve_customer_context(self, event: MessageAddedEvent):
         """Retrieve memories and prepend to system prompt when a user message is added."""
-        if event.message.role != "user":
-            return
+        try:
+            message = getattr(event, 'message', {})
+            if not isinstance(message, dict):
+                return
+
+            role = message.get("role")
+            if role != "user":
+                return
+                
+            content = message.get("content", [])
             
-        content = event.message.content
-        if isinstance(content, list) and len(content) > 0 and "text" in content[0]:
-            self.original_user_prompt = content[0]["text"]
-        elif isinstance(content, str):
-            self.original_user_prompt = content
-        else:
-            return
+            # Extract plain text from the content block
+            if isinstance(content, list) and len(content) > 0 and isinstance(content[0], dict) and "text" in content[0]:
+                self.original_user_prompt = content[0]["text"]
+            elif isinstance(content, str):
+                self.original_user_prompt = content
+            else:
+                return
 
-        collected_memories = []
-        unique_texts = set()
+            collected_memories = []
+            unique_texts = set()
 
-        for strategy_type, ns_list in self.namespaces.items():
-            for ns_template in ns_list:
-                formatted_namespace = ns_template.format(actorId=self.actor_id)
-                try:
-                    memories = self.memory_client.retrieve_memories(
-                        memory_id=self.memory_id,
-                        namespace=formatted_namespace,
-                        query=self.original_user_prompt,
-                        top_k=5,
-                    )
-                    
-                    iterable_memories = memories if isinstance(memories, list) else []
-                    if isinstance(memories, dict) and "memories" in memories:
-                        iterable_memories = memories["memories"]
+            for strategy_type, ns_list in self.namespaces.items():
+                for ns_template in ns_list:
+                    formatted_namespace = ns_template.format(actorId=self.actor_id)
+                    try:
+                        memories = self.memory_client.retrieve_memories(
+                            memory_id=self.memory_id,
+                            namespace=formatted_namespace,
+                            query=self.original_user_prompt,
+                            top_k=5,
+                        )
+                        
+                        iterable_memories = memories if isinstance(memories, list) else []
+                        if isinstance(memories, dict) and "memories" in memories:
+                            iterable_memories = memories["memories"]
 
-                    for mem in iterable_memories:
-                        if isinstance(mem, dict) and "content" in mem and "text" in mem["content"]:
-                            text = mem["content"]["text"].strip()
-                        else:
-                            continue
-                            
-                        if text and text not in unique_texts:
-                            unique_texts.add(text)
-                            collected_memories.append(f"- [{strategy_type}] {text}")
-                except Exception as e:
-                    logger.warning(f"Failed to retrieve memory for namespace {formatted_namespace}: {e}")
+                        for mem in iterable_memories:
+                            if isinstance(mem, dict) and "content" in mem and "text" in mem["content"]:
+                                text = mem["content"]["text"].strip()
+                            else:
+                                continue
+                                
+                            if text and text not in unique_texts:
+                                unique_texts.add(text)
+                                collected_memories.append(f"- [{strategy_type}] {text}")
+                    except Exception as e:
+                        logger.warning(f"Failed to retrieve memory for namespace {formatted_namespace}: {e}")
 
-        if collected_memories:
-            memory_text = (
-                "[SYSTEM NOTE: RETRIEVED CUSTOMER MEMORY]\n"
-                "The following details are from previous interactions with this customer:\n"
-                + "\n".join(collected_memories) + "\n\n"
-                "Use this context when answering. Do not say you lack memory or prior context.\n\n"
-            )
-            
-            if isinstance(event.message.content, list) and "text" in event.message.content[0]:
-                event.message.content[0]["text"] = memory_text + "Current customer request:\n" + self.original_user_prompt
-            elif isinstance(event.message.content, str):
-                event.message.content = memory_text + "Current customer request:\n" + self.original_user_prompt
+            if collected_memories:
+                memory_text = (
+                    "[SYSTEM NOTE: RETRIEVED CUSTOMER MEMORY]\n"
+                    "The following details are from previous interactions with this customer:\n"
+                    + "\n".join(collected_memories) + "\n\n"
+                    "Use this context when answering. Do not say you lack memory or prior context.\n\n"
+                )
+                
+                # Prepend retrieved memories back into the prompt
+                if isinstance(content, list) and isinstance(content[0], dict) and "text" in content[0]:
+                    content[0]["text"] = memory_text + "Current customer request:\n" + self.original_user_prompt
+                elif isinstance(content, str):
+                    message["content"] = memory_text + "Current customer request:\n" + self.original_user_prompt
+
+        except Exception as e:
+            logger.error(f"Error in retrieve_customer_context hook: {e}")
 
     def save_support_interaction(self, event: AfterInvocationEvent):
         """Save the conversation to memory using the clean original user prompt."""
-        assistant_text = ""
-        response = event.response
-        content = getattr(response, "content", response)
-        
-        if isinstance(content, str):
-            assistant_text = content
-        elif isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, dict) and "text" in block:
-                    parts.append(str(block["text"]))
-                elif hasattr(block, "text"):
-                    parts.append(str(getattr(block, "text")))
-                elif isinstance(block, str):
-                    parts.append(block)
-            assistant_text = " ".join(parts).strip()
-
-        if not assistant_text or not self.original_user_prompt:
-            return
-
-        bad_phrases = [
-            "don't have access", "don't remember", "cannot remember", 
-            "lack prior", "no memory", "persistent memory", "previous conversation"
-        ]
-        if any(bp in assistant_text.lower() for bp in bad_phrases):
-            return
-
         try:
+            # Safely navigate: event -> result -> message -> content
+            result = getattr(event, 'result', None)
+            if not result:
+                return
+                
+            message = getattr(result, 'message', {})
+            if not isinstance(message, dict):
+                return
+                
+            content = message.get("content", [])
+            assistant_text = ""
+            
+            if isinstance(content, list) and len(content) > 0 and isinstance(content[0], dict) and "text" in content[0]:
+                assistant_text = content[0]["text"]
+            elif isinstance(content, str):
+                assistant_text = content
+
+            if not assistant_text or not self.original_user_prompt:
+                return
+
+            bad_phrases = [
+                "don't have access", "don't remember", "cannot remember", 
+                "lack prior", "no memory", "persistent memory", "previous conversation"
+            ]
+            if any(bp in assistant_text.lower() for bp in bad_phrases):
+                logger.info("Skipping memory save due to stateless hallucination.")
+                return
+
             self.memory_client.create_event(
                 memory_id=self.memory_id,
                 actor_id=self.actor_id,
@@ -208,8 +214,9 @@ class MemoryHook(HookProvider):
                     (assistant_text, "ASSISTANT"),
                 ],
             )
+            logger.info(f"Saved memory event for actor={self.actor_id} session={self.session_id}")
         except Exception as e:
-            logger.error(f"Failed to save memory event: {e}")
+            logger.error(f"Failed to save memory event in hook: {e}")
 
 
 # ── Knowledge Base Tool ─────────────────────────────────────────────
